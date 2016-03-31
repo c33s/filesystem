@@ -13,6 +13,9 @@ namespace Symfony\Component\Filesystem;
 
 use Symfony\Component\Filesystem\Exception\IOException;
 use Symfony\Component\Filesystem\Exception\FileNotFoundException;
+use Symfony\Component\Process\ExecutableFinder;
+use Symfony\Component\Process\Process;
+use Symfony\Component\Process\ProcessBuilder;
 
 /**
  * Provides basic utility to manipulate the file system.
@@ -24,18 +27,18 @@ class Filesystem
     /**
      * Copies a file.
      *
-     * If the target file is older than the origin file, it's always overwritten.
-     * If the target file is newer, it is overwritten only when the
-     * $overwriteNewerFiles option is set to true.
+     * This method only copies the file if the origin file is newer than the target file.
      *
-     * @param string $originFile          The original filename
-     * @param string $targetFile          The target filename
-     * @param bool   $overwriteNewerFiles If true, target files newer than origin files are overwritten
+     * By default, if the target already exists, it is not overridden.
+     *
+     * @param string $originFile The original filename
+     * @param string $targetFile The target filename
+     * @param bool   $override   Whether to override an existing file or not
      *
      * @throws FileNotFoundException When originFile doesn't exist
      * @throws IOException           When copy fails
      */
-    public function copy($originFile, $targetFile, $overwriteNewerFiles = false)
+    public function copy($originFile, $targetFile, $override = false)
     {
         if (stream_is_local($originFile) && !is_file($originFile)) {
             throw new FileNotFoundException(sprintf('Failed to copy "%s" because file does not exist.', $originFile), 0, null, $originFile);
@@ -44,7 +47,7 @@ class Filesystem
         $this->mkdir(dirname($targetFile));
 
         $doCopy = true;
-        if (!$overwriteNewerFiles && null === parse_url($originFile, PHP_URL_HOST) && is_file($targetFile)) {
+        if (!$override && null === parse_url($originFile, PHP_URL_HOST) && is_file($targetFile)) {
             $doCopy = filemtime($originFile) > filemtime($targetFile);
         }
 
@@ -158,23 +161,27 @@ class Filesystem
         $files = iterator_to_array($this->toIterator($files));
         $files = array_reverse($files);
         foreach ($files as $file) {
-            if (@(unlink($file) || rmdir($file))) {
+            if (!$this->exists($file) && !$this->isLink($file)) {
                 continue;
             }
-            if (is_link($file)) {
-                // See https://bugs.php.net/52176
-                $error = error_get_last();
-                throw new IOException(sprintf('Failed to remove symlink "%s": %s.', $file, $error['message']));
-            } elseif (is_dir($file)) {
+
+            if (is_dir($file) && !$this->isLink($file)) {
                 $this->remove(new \FilesystemIterator($file));
 
-                if (!@rmdir($file)) {
-                    $error = error_get_last();
-                    throw new IOException(sprintf('Failed to remove directory "%s": %s.', $file, $error['message']));
+                if (true !== @rmdir($file)) {
+                    throw new IOException(sprintf('Failed to remove directory "%s".', $file), 0, null, $file);
                 }
-            } elseif (file_exists($file)) {
-                $error = error_get_last();
-                throw new IOException(sprintf('Failed to remove file "%s": %s.', $file, $error['message']));
+            } else {
+                // https://bugs.php.net/bug.php?id=52176
+                if ('\\' === DIRECTORY_SEPARATOR && is_dir($file)) {
+                    if (true !== @rmdir($file)) {
+                        throw new IOException(sprintf('Failed to remove file "%s".', $file), 0, null, $file);
+                    }
+                } else {
+                    if (true !== @unlink($file)) {
+                        throw new IOException(sprintf('Failed to remove file "%s".', $file), 0, null, $file);
+                    }
+                }
             }
         }
     }
@@ -195,7 +202,7 @@ class Filesystem
             if (true !== @chmod($file, $mode & ~$umask)) {
                 throw new IOException(sprintf('Failed to chmod file "%s".', $file), 0, null, $file);
             }
-            if ($recursive && is_dir($file) && !is_link($file)) {
+            if ($recursive && is_dir($file) && !$this->isLink($file)) {
                 $this->chmod(new \FilesystemIterator($file), $mode, $umask, true);
             }
         }
@@ -213,10 +220,10 @@ class Filesystem
     public function chown($files, $user, $recursive = false)
     {
         foreach ($this->toIterator($files) as $file) {
-            if ($recursive && is_dir($file) && !is_link($file)) {
+            if ($recursive && is_dir($file) && !$this->isLink($file)) {
                 $this->chown(new \FilesystemIterator($file), $user, true);
             }
-            if (is_link($file) && function_exists('lchown')) {
+            if ($this->isLink($file) && function_exists('lchown')) {
                 if (true !== @lchown($file, $user)) {
                     throw new IOException(sprintf('Failed to chown file "%s".', $file), 0, null, $file);
                 }
@@ -240,10 +247,10 @@ class Filesystem
     public function chgrp($files, $group, $recursive = false)
     {
         foreach ($this->toIterator($files) as $file) {
-            if ($recursive && is_dir($file) && !is_link($file)) {
+            if ($recursive && is_dir($file) && !$this->isLink($file)) {
                 $this->chgrp(new \FilesystemIterator($file), $group, true);
             }
-            if (is_link($file) && function_exists('lchgrp')) {
+            if ($this->isLink($file) && function_exists('lchgrp')) {
                 if (true !== @lchgrp($file, $group) || (defined('HHVM_VERSION') && !posix_getgrnam($group))) {
                     throw new IOException(sprintf('Failed to chgrp file "%s".', $file), 0, null, $file);
                 }
@@ -304,26 +311,33 @@ class Filesystem
      */
     public function symlink($originDir, $targetDir, $copyOnWindows = false)
     {
-        if ('\\' === DIRECTORY_SEPARATOR) {
-            $originDir = strtr($originDir, '/', '\\');
-            $targetDir = strtr($targetDir, '/', '\\');
+//        var_dump('mine');
+        if ('\\' === DIRECTORY_SEPARATOR && $copyOnWindows) {
+            $this->mirror($originDir, $targetDir);
 
-            if ($copyOnWindows) {
-                $this->mirror($originDir, $targetDir);
-
-                return;
-            }
+            return;
         }
+//        var_dump('after copy');
 
         $this->mkdir(dirname($targetDir));
 
         $ok = false;
-        if (is_link($targetDir)) {
+        if ($this->isLink($targetDir)) {
             if (readlink($targetDir) != $originDir) {
                 $this->remove($targetDir);
             } else {
                 $ok = true;
             }
+        }
+//        var_dump('after islink check');
+
+
+
+
+        if ('\\' === DIRECTORY_SEPARATOR && $this->existsMklinkExecutable()) {
+//            var_dump('here');
+            $this->createWindowsJunction($originDir, $targetDir);
+            $ok = true;
         }
 
         if (!$ok && true !== @symlink($originDir, $targetDir)) {
@@ -335,6 +349,118 @@ class Filesystem
             }
             throw new IOException(sprintf('Failed to create symbolic link from "%s" to "%s".', $originDir, $targetDir), 0, null, $targetDir);
         }
+    }
+
+    protected function isJunction($filename)
+    {
+
+    }
+
+    public function isLink($filename)
+    {
+        if ('\\' !== DIRECTORY_SEPARATOR){
+            return is_link($filename);
+        }
+
+        // handle windows stuff
+
+        clearstatcache();
+
+        // symlink
+        if (is_link($filename) && @filetype($filename) == 'link' && @readlink($filename)) {
+            return true;
+        }
+
+        $lstat = @lstat($filename);
+        $stat = @stat($filename);
+
+        // junction
+        if (file_exists($filename) && @filetype($filename) == 'unknown' && !empty(@array_diff( $stat, $lstat))) {
+            return true;
+        }
+
+        // file hardlink
+        if (@filetype($filename) == 'file' && is_array($lstat) && array_key_exists('size', $stat) && $stat['size'] == 2) {
+            return true;
+        }
+
+        return false;
+    }
+    
+    public function isLink2($filename)
+    {
+        if ('\\' !== DIRECTORY_SEPARATOR){
+            return is_link($filename);
+        }
+
+        // handle windows stuff
+
+        clearstatcache();
+
+        if (!is_link($filename) && (@filetype($filename) == 'dir')) {
+            return false;
+        }
+
+        if (is_link($filename) && @filetype($filename) == 'link' && @readlink($filename)) {
+            return true;
+        }
+
+        if (!@readlink($filename)) {
+            return false;
+        }
+
+        $lstat = @lstat($filename);
+        $stat = @stat($filename);
+
+        // junction
+        if (file_exists($filename) && @filetype($filename) == 'unknown' && !empty(@array_diff( $stat, $lstat))) {
+            return true;
+        }
+
+        // file hardlink
+        if (@filetype($filename) == 'file' && is_array($lstat) && array_key_exists('size', $stat) && $stat['size'] == 2) {
+            return true;
+        }
+
+        // realfile or broken hardlink==realfile?
+        if (@filetype($filename) == 'file' && is_array($lstat) && array_key_exists('size', $stat) && $stat['size'] === 0 ) {
+            return false;
+        }
+
+        return false;
+    }
+
+    protected function existsMklinkExecutable()
+    {
+        if ($this->getMklinkExecutable()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    protected function getMklinkExecutable()
+    {
+        //$executableFinder = new ExecutableFinder();
+        //$executableFinder->find('mklink');
+        $cmd = 'mklink';
+
+        return $cmd;
+    }
+
+    protected function createWindowsJunction($originDir, $targetDir)
+    {
+        $linker = $this->getMklinkExecutable();
+        $targetBaseDir = dirname($targetDir);
+        $linkName = basename($targetDir);
+
+        $process = new Process("cd $targetBaseDir && $linker /J /D \"$linkName\" \"$originDir\"");
+        $process
+            ->setTimeout(null)
+            ->run(function ($type, $buffer) {
+                echo '> '.$buffer;
+
+            });
     }
 
     /**
@@ -434,7 +560,7 @@ class Filesystem
             $target = str_replace($originDir, $targetDir, $file->getPathname());
 
             if ($copyOnWindows) {
-                if (is_file($file)) {
+                if ($this->isLink($file) || is_file($file)) {
                     $this->copy($file, $target, isset($options['override']) ? $options['override'] : false);
                 } elseif (is_dir($file)) {
                     $this->mkdir($target);
@@ -442,7 +568,7 @@ class Filesystem
                     throw new IOException(sprintf('Unable to guess "%s" file type.', $file), 0, null, $file);
                 }
             } else {
-                if (is_link($file)) {
+                if ($this->isLink($file)) {
                     $this->symlink($file->getLinkTarget(), $target);
                 } elseif (is_dir($file)) {
                     $this->mkdir($target);
@@ -486,13 +612,13 @@ class Filesystem
     {
         list($scheme, $hierarchy) = $this->getSchemeAndHierarchy($dir);
 
-        // If no scheme or scheme is "file" or "gs" (Google Cloud) create temp file in local filesystem
-        if (null === $scheme || 'file' === $scheme || 'gs' === $scheme) {
+        // If no scheme or scheme is "file" create temp file in local filesystem
+        if (null === $scheme || 'file' === $scheme) {
             $tmpFile = tempnam($hierarchy, $prefix);
 
             // If tempnam failed or no scheme return the filename otherwise prepend the scheme
             if (false !== $tmpFile) {
-                if (null !== $scheme && 'gs' !== $scheme) {
+                if (null !== $scheme) {
                     return $scheme.'://'.$tmpFile;
                 }
 
